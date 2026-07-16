@@ -93,13 +93,57 @@ impl DepGraph {
             })
             .collect();
 
+        let removed = self.remove_contexts(&expired);
+        self.prune_unreferenced();
+        removed
+    }
+
+    /// Remove up to `count` least-recently-accessed contexts.
+    /// Returns the number of entries removed.
+    ///
+    /// Age-based [`Self::trim`] cannot express "free this much and no more":
+    /// a memory-budget shortfall is a byte count, and every context removed
+    /// past it buys nothing while costing a recompile — the context holds the
+    /// artifact key that makes an on-disk artifact addressable. Callers
+    /// enforcing a budget use this so a breach evicts proportionally rather
+    /// than emptying the graph.
+    pub fn trim_oldest(&self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        let mut by_age: Vec<(Instant, ContextKey)> = self
+            .contexts
+            .iter()
+            .map(|entry| (entry.last_accessed, *entry.key()))
+            .collect();
+        by_age.sort_unstable_by_key(|(last_accessed, _)| *last_accessed);
+        let victims: Vec<ContextKey> = by_age.into_iter().take(count).map(|(_, key)| key).collect();
+
+        let removed = self.remove_contexts(&victims);
+        self.prune_unreferenced();
+        removed
+    }
+
+    /// Remove `keys` from the context map. Returns how many were present.
+    ///
+    /// Two-pass eviction: callers collect the victim keys first so no DashMap
+    /// shard lock is held across the scan, and each removal here takes only
+    /// the matching shard's lock briefly.
+    fn remove_contexts(&self, keys: &[ContextKey]) -> usize {
         let mut removed = 0;
-        for key in expired {
-            if self.contexts.remove(&key).is_some() {
+        for key in keys {
+            if self.contexts.remove(key).is_some() {
                 removed += 1;
             }
         }
+        removed
+    }
 
+    /// Drop extern, env-dep, and file entries no longer reachable from any
+    /// live context. Runs after every context removal so the side tables
+    /// cannot outlive the contexts that referenced them.
+    fn prune_unreferenced(&self) {
         let live_contexts: std::collections::HashSet<ContextKey> =
             self.contexts.iter().map(|entry| *entry.key()).collect();
         let stale_externs: Vec<ContextKey> = self
@@ -159,8 +203,6 @@ impl DepGraph {
         for path in unreferenced_files {
             self.files.remove(&path);
         }
-
-        removed
     }
 
     /// Clear all graph state: files, contexts, and stats counters.

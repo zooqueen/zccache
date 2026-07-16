@@ -472,6 +472,70 @@ fn trim_keeps_recent_entries() {
 }
 
 #[test]
+fn trim_oldest_removes_least_recently_accessed_first() {
+    let graph = DepGraph::new();
+    let old_a = graph.register(make_ctx("/src/old_a.c"));
+    let old_b = graph.register(make_ctx("/src/old_b.c"));
+
+    // A measurable gap so the access ordering is unambiguous.
+    std::thread::sleep(Duration::from_millis(5));
+
+    let recent_a = graph.register(make_ctx("/src/recent_a.c"));
+    let recent_b = graph.register(make_ctx("/src/recent_b.c"));
+
+    assert_eq!(graph.trim_oldest(2), 2);
+    assert_eq!(graph.stats().context_count, 2);
+    assert!(graph.get_state(&old_a).is_none());
+    assert!(graph.get_state(&old_b).is_none());
+    assert!(graph.get_state(&recent_a).is_some());
+    assert!(graph.get_state(&recent_b).is_some());
+}
+
+#[test]
+fn trim_oldest_removes_at_most_count() {
+    let graph = DepGraph::new();
+    for i in 0..10 {
+        graph.register(make_ctx(&format!("/src/n{i}.c")));
+    }
+
+    assert_eq!(graph.trim_oldest(0), 0);
+    assert_eq!(graph.stats().context_count, 10);
+
+    assert_eq!(graph.trim_oldest(3), 3);
+    assert_eq!(graph.stats().context_count, 7);
+
+    // Asking for more than exist removes what is there and stops.
+    assert_eq!(graph.trim_oldest(100), 7);
+    assert_eq!(graph.stats().context_count, 0);
+}
+
+#[test]
+fn trim_oldest_leaves_survivors_hittable() {
+    // Survivors must stay usable, not merely present: a context is what makes
+    // its on-disk artifact addressable, so a survivor still has to report
+    // warm and still resolve to its artifact key.
+    let graph = DepGraph::new();
+    let stale = graph.register(make_ctx("/src/stale.c"));
+
+    std::thread::sleep(Duration::from_millis(5));
+
+    let keep = graph.register(make_ctx("/src/keep.c"));
+    let scan = ScanResult {
+        resolved: Vec::new(),
+        unresolved: Vec::new(),
+        has_computed: false,
+    };
+    let artifact_key = graph
+        .update(&keep, scan, dummy_hash)
+        .expect("context is warm");
+
+    assert_eq!(graph.trim_oldest(1), 1);
+    assert!(graph.get_state(&stale).is_none());
+    assert!(!graph.is_cold(&keep));
+    assert_eq!(graph.try_fast_hit(&keep, dummy_hash), Some(artifact_key));
+}
+
+#[test]
 fn stats_track_checks_and_hits() {
     let graph = DepGraph::new();
     let key = graph.register(make_ctx("/src/a.c"));

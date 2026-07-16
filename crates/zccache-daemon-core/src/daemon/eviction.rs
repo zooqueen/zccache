@@ -77,18 +77,30 @@ pub(crate) fn memory_snapshot(
         .map(|entry| entry.value().meta.total_size as usize)
         .sum();
 
-    // NOTE: artifact_payload_bytes is intentionally excluded from the memory
-    // budget.  Artifact payloads are persisted on disk and governed by
-    // `max_cache_size` (disk GC).  Including them here caused the memory
-    // eviction loop to wipe the dep graph every 30 s when artifact payload
-    // exceeded the 1 GB budget — the root cause of Bug 2 (0% hit rate).
+    // `total_bytes` measures only what this eviction pass can actually free.
+    //
+    // Artifact payloads are excluded: they live on disk and are governed by
+    // `max_cache_size` (disk GC). Counting them here made the eviction loop
+    // wipe the dep graph every 30 s once payload exceeded the 1 GB budget —
+    // the root cause of Bug 2 (0% hit rate).
+    //
+    // `in_flight_bytes` is excluded for the same reason: it is the payload of
+    // artifacts being written to disk, counted while the persistence task
+    // holds it. Eviction has no actuator over it — trimming the fast-hit
+    // cache, metadata, or the dep graph frees none of it, and it drains on
+    // its own when the write completes. Counting it let a burst of large
+    // rustc artifacts push the total over budget, and the pass then cascaded
+    // to the only reducible term it had left: the dep graph. That reproduced
+    // Bug 2 exactly — contexts wiped, every later compile `is_cold`, so the
+    // daemon stored artifacts it could never address again. Concurrent
+    // persistence memory is bounded by compile concurrency, not by discarding
+    // the index that makes the disk cache reachable.
     let total_bytes = metadata_entries * METADATA_ENTRY_BYTES
         + journal_entries * JOURNAL_ENTRY_BYTES
         + depgraph_files * DEPGRAPH_FILE_BYTES
         + depgraph_contexts * DEPGRAPH_CONTEXT_BYTES
         + fast_hit_entries * FAST_HIT_ENTRY_BYTES
-        + artifact_entries * ARTIFACT_OVERHEAD_BYTES
-        + in_flight_bytes;
+        + artifact_entries * ARTIFACT_OVERHEAD_BYTES;
 
     MemorySnapshot {
         metadata_entries,
@@ -173,11 +185,23 @@ pub(crate) fn evict_to_budget(
         to_free = to_free.saturating_sub(freed);
     }
 
-    // Priority 3: depgraph contexts (trim all, then orphaned files cleaned up).
+    // Priority 3: depgraph contexts, least-recently-accessed first, and only
+    // as many as the remaining shortfall needs (orphaned files are cleaned up
+    // with them).
+    //
+    // This term is last because it is the most expensive to lose: a context
+    // carries the artifact key that makes an on-disk artifact addressable, so
+    // dropping one costs a full recompile. Evicting proportionally — as
+    // priority 2 already does — keeps a budget breach from cascading into a
+    // total loss of the index. `trim(Duration::ZERO)` removed every context
+    // regardless of the size of the shortfall, which left every subsequent
+    // compile `is_cold` and turned the daemon write-only until the graph was
+    // rebuilt from scratch. Same failure #454 fixed for the fast-hit cache.
     if to_free > 0 {
         let dg_stats = dep_graph.stats();
         if dg_stats.context_count > 0 {
-            let removed = dep_graph.trim(Duration::ZERO);
+            let wanted = (to_free as usize).div_ceil(DEPGRAPH_CONTEXT_BYTES);
+            let removed = dep_graph.trim_oldest(wanted);
             let freed = (removed * DEPGRAPH_CONTEXT_BYTES) as u64;
             // File entries cleaned up by trim() internally.
             let files_after = dep_graph.stats().file_count;
@@ -609,26 +633,76 @@ mod tests {
         let (freed, items) = evict_to_budget(budget, &cs, &dg, &fh, &art, 0);
         assert!(freed > 0);
         assert!(items > 0);
-        // Depgraph contexts should be cleared (trim(ZERO) removes all).
+        // The shortfall here exceeds every context's estimated footprint, so
+        // evicting all 20 is the proportional answer.
         assert_eq!(dg.stats().context_count, 0);
     }
 
     #[test]
-    fn snapshot_includes_in_flight_bytes() {
+    fn budget_breach_evicts_contexts_proportionally() {
+        // A breach must cost only the contexts the shortfall calls for. The
+        // old `trim(Duration::ZERO)` emptied the graph whatever the shortfall,
+        // which cost a recompile per context and dropped the hit rate to zero
+        // until the graph was rebuilt.
         let (cs, dg, fh, art) = empty_caches();
-        let snap = memory_snapshot(&cs, &dg, &fh, &art, 500_000);
-        assert_eq!(snap.in_flight_bytes, 500_000);
-        assert_eq!(snap.total_bytes, 500_000);
+
+        for i in 0..1000 {
+            dg.register(make_ctx(&format!("/tmp/prop{i}.c")));
+        }
+        // 1000 * 2048 = 2_048_000 estimated. Budget 2_000_000 → target
+        // 1_800_000 → shortfall 248_000 → 122 contexts, not 1000.
+        let (_freed, _items) = evict_to_budget(2_000_000, &cs, &dg, &fh, &art, 0);
+
+        let survivors = dg.stats().context_count;
+        assert_eq!(survivors, 1000 - 122);
     }
 
     #[test]
-    fn in_flight_bytes_push_over_budget_triggers_eviction() {
+    fn snapshot_excludes_in_flight_bytes_from_budget_total() {
+        // In-flight payload is reported for observability but kept out of the
+        // budget total: eviction cannot free it, and it drains on its own when
+        // the persistence task completes.
+        let (cs, dg, fh, art) = empty_caches();
+        let snap = memory_snapshot(&cs, &dg, &fh, &art, 500_000);
+        assert_eq!(snap.in_flight_bytes, 500_000);
+        assert_eq!(snap.total_bytes, 0);
+    }
+
+    #[test]
+    fn in_flight_burst_preserves_depgraph_contexts() {
+        // Regression: a burst of large artifact writes must not cost the dep
+        // graph. Counting `in_flight_bytes` against the budget pushed the pass
+        // over the limit, and it cascaded to the one term it could reduce —
+        // the contexts holding the artifact keys. Every later compile then
+        // read `is_cold`, so the daemon stored artifacts it could never look
+        // up again: a cache that writes and never hits.
         let (cs, dg, fh, art) = empty_caches();
 
-        // Add fast-hit entries worth 100 * 200 = 20_000 bytes estimated.
-        // Aged past FAST_HIT_BUDGET_TRIM_MAX_AGE so the budget-pressure
-        // trim is allowed to wipe them — recent entries are intentionally
-        // preserved by #454.
+        for i in 0..200 {
+            dg.register(make_ctx(&format!("/tmp/burst{i}.c")));
+        }
+        assert_eq!(dg.stats().context_count, 200);
+
+        // 2 GB of rustc artifacts persisting against the 1 GB default budget.
+        let (freed, items) =
+            evict_to_budget(1_073_741_824, &cs, &dg, &fh, &art, 2 * 1024 * 1024 * 1024);
+
+        assert_eq!(freed, 0);
+        assert_eq!(items, 0);
+        assert_eq!(
+            dg.stats().context_count,
+            200,
+            "in-flight persistence bytes must not evict dep graph contexts",
+        );
+    }
+
+    #[test]
+    fn in_flight_bytes_do_not_trigger_eviction() {
+        let (cs, dg, fh, art) = empty_caches();
+
+        // Add fast-hit entries worth 100 * 200 = 20_000 bytes estimated,
+        // aged past FAST_HIT_BUDGET_TRIM_MAX_AGE so nothing but the budget
+        // decision keeps them alive.
         let aged = Instant::now() - Duration::from_secs(60);
         for i in 0..100 {
             fh.insert(
@@ -646,12 +720,13 @@ mod tests {
         assert_eq!(freed, 0);
         assert_eq!(items, 0);
 
-        // Now add 90_000 in-flight bytes → total = 110_000 > 100_000 budget.
+        // 90_000 in-flight bytes is payload on its way to disk, not a term
+        // this pass can reduce. It must not provoke an eviction that frees
+        // none of it.
         let (freed, items) = evict_to_budget(100_000, &cs, &dg, &fh, &art, 90_000);
-        assert!(freed > 0);
-        assert!(items > 0);
-        // Fast-hit entries should have been evicted to bring total under budget.
-        assert!(fh.is_empty());
+        assert_eq!(freed, 0);
+        assert_eq!(items, 0);
+        assert_eq!(fh.len(), 100);
     }
 
     #[test]
