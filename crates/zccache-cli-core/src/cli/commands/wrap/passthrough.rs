@@ -1,5 +1,7 @@
-//! Direct execution paths used when wrapper caching is disabled or unsupported.
+//! Direct execution paths used when wrapper caching is disabled, unsupported,
+//! or unavailable.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -33,6 +35,71 @@ fn run_with_released_cwd(
         release_cwd_for_command(cmd, &cwd);
     }
     cmd.status()
+}
+
+/// Run the real tool because the daemon could not return a verdict for it.
+///
+/// Wrapping a compiler in zccache must not change whether the build succeeds:
+/// an unreachable, wedged, crashed, or protocol-broken daemon is an
+/// infrastructure fault, not a compile error. Reporting one as a failed compile
+/// makes cargo print `could not compile <crate>` with no diagnostics and breaks
+/// builds that compile cleanly without the wrapper, and no `cargo clean` can
+/// clear it because the fault is in the wrapper, not in `target/`. Only a real
+/// compiler verdict (`Response::CompileResult`, cached or fresh) is relayed
+/// as-is; every other outcome lands here and is answered by running the tool.
+///
+/// The fault stays observable rather than fatal: `reason` names it on stderr,
+/// and the caller has already written the matching `client-disconnected`
+/// lifecycle event and killed a wedged daemon so the next invocation starts
+/// fresh. sccache resolves a lost server the same way ("the server looks like
+/// it shut down unexpectedly, compiling locally instead").
+///
+/// `cwd` is passed explicitly because the wrapper has already released its own
+/// working directory (see `run_wrap`), and `stdin` carries the bytes the
+/// wrapper slurped off its stdin so a piped invocation replays them instead of
+/// handing the child an exhausted pipe.
+pub(super) fn run_locally(
+    tool: &Path,
+    args: &[String],
+    cwd: &Path,
+    stdin: &[u8],
+    reason: &str,
+) -> ExitCode {
+    eprintln!(
+        "zccache[warn][F]: {reason}; running {} directly, uncached",
+        tool.display()
+    );
+
+    let mut cmd = std::process::Command::new(tool);
+    cmd.args(args).current_dir(cwd);
+    if !stdin.is_empty() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("zccache[err][F]: failed to run {}: {e}", tool.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    if !stdin.is_empty() {
+        // Dropping the handle at the end of this block closes the pipe, which
+        // is the child's EOF — without it a compiler reading stdin hangs.
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(stdin);
+        }
+    }
+    match child.wait() {
+        Ok(status) => exit_code_from_i32(status.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!(
+                "zccache[err][F]: failed to wait for {}: {e}",
+                tool.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Run the compiler/tool directly without caching (`ZCCACHE_DISABLE` mode).
