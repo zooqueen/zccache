@@ -18,12 +18,18 @@ pub(super) async fn cmd_compile(
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     let stdin_bytes = slurp_stdin_if_piped();
+    let locally = |reason: String| {
+        super::passthrough::run_locally(
+            compiler.as_path(),
+            &args,
+            cwd.as_path(),
+            &stdin_bytes,
+            &reason,
+        )
+    };
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("zccache[err][C]: cannot connect to daemon at {endpoint}: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return locally(format!("cannot connect to daemon at {endpoint}: {e}")),
     };
 
     let wire = crate::protocol::wire_prost::full_family_wire_format_from_env();
@@ -36,13 +42,15 @@ pub(super) async fn cmd_compile(
         stdin: stdin_bytes.clone(),
     };
     if let Err(e) = conn.send_request(&request, wire).await {
-        eprintln!("zccache[err][S]: failed to send to daemon: {e}");
-        return ExitCode::FAILURE;
+        return locally(format!("failed to send to daemon at {endpoint}: {e}"));
     }
 
     match compile_recv_with_wedge_detection(&mut conn, wedge_recv_timeout()).await {
         CompileRecvOutcome::Done(recv_result) => {
             relay_compile_response(recv_result, &mut std::io::stdout(), &mut std::io::stderr())
+                .unwrap_or_else(|| {
+                    locally(format!("daemon at {endpoint} returned no compile verdict"))
+                })
         }
         CompileRecvOutcome::Wedged => {
             // Daemon went past the wedge budget for *this* request. Pre-#753
@@ -78,19 +86,21 @@ pub(super) async fn cmd_compile(
                 WedgeAction::EscalateKill | WedgeAction::EscalateKillProbeError => {
                     // The daemon is genuinely wedged: it missed the
                     // per-request wedge budget AND failed the follow-up
-                    // responsiveness probe. Per the fail-fast policy (#955)
-                    // a *detected* wedge fails IMMEDIATELY — we do not mask
-                    // it with a slow uncached retry/fallback. Kill the
-                    // wedged daemon so the next invocation starts fresh,
-                    // then surface the failure now. (The root-cause daemon
-                    // fix keeps this path from triggering in normal builds.)
+                    // responsiveness probe. Kill it so the next invocation
+                    // starts fresh, then answer this request by compiling
+                    // locally: a wedged daemon is an infrastructure fault,
+                    // and failing the build is not an acceptable way to
+                    // report one. The wedge stays just as visible — this
+                    // warning, the lifecycle events, and the daemon kill all
+                    // still happen — it just no longer takes the build down
+                    // with it.
                     eprintln!(
-                        "zccache[err][W]: daemon at {endpoint} is wedged \
-                         (missed wedge budget + failed probe); killing it and \
-                         failing immediately — issue #955"
+                        "zccache[warn][W]: daemon at {endpoint} is wedged \
+                         (missed wedge budget + failed probe); killing it so the \
+                         next invocation starts fresh"
                     );
                     stop_stale_daemon(endpoint).await;
-                    ExitCode::FAILURE
+                    locally(format!("daemon at {endpoint} was wedged"))
                 }
             }
         }
@@ -103,8 +113,7 @@ pub(super) async fn cmd_compile(
                 crate::core::lifecycle::CAUSE_COMM_ERROR,
                 &msg,
             );
-            eprintln!("zccache[err][R]: {msg}");
-            ExitCode::FAILURE
+            locally(msg)
         }
     }
 }
@@ -341,10 +350,13 @@ pub(super) async fn cmd_compile_ephemeral(
         client_pid: std::process::id(),
         working_dir: cwd.clone(),
         compiler: compiler.into(),
-        args,
-        cwd,
+        args: args.clone(),
+        cwd: cwd.clone(),
         env: Some(client_env),
-        stdin: stdin_bytes,
+        stdin: stdin_bytes.clone(),
+    };
+    let locally = |reason: String| {
+        super::passthrough::run_locally(compiler, &args, cwd.as_path(), &stdin_bytes, &reason)
     };
 
     // Issue #752: retry once on transport failure
@@ -363,19 +375,19 @@ pub(super) async fn cmd_compile_ephemeral(
     match outcome {
         CompileRecvOutcome::Done(recv_result) => {
             relay_compile_response(recv_result, &mut std::io::stdout(), &mut std::io::stderr())
+                .unwrap_or_else(|| {
+                    locally(format!("daemon at {endpoint} returned no compile verdict"))
+                })
         }
         CompileRecvOutcome::Wedged => {
             eprintln!(
-                "zccache[err][W]: daemon at {endpoint} stopped responding within \
+                "zccache[warn][W]: daemon at {endpoint} stopped responding within \
                  the wedge budget; killing it so the next compile starts fresh — issue #666"
             );
             stop_stale_daemon(endpoint).await;
-            ExitCode::FAILURE
+            locally(format!("daemon at {endpoint} was wedged"))
         }
-        CompileRecvOutcome::Failed(msg) => {
-            eprintln!("zccache[err][R]: {msg}");
-            ExitCode::FAILURE
-        }
+        CompileRecvOutcome::Failed(msg) => locally(msg),
     }
 }
 
@@ -390,10 +402,13 @@ pub(super) async fn cmd_link_ephemeral(
     let request = crate::protocol::Request::LinkEphemeral {
         client_pid: std::process::id(),
         tool: tool.into(),
-        args,
-        cwd,
+        args: args.clone(),
+        cwd: cwd.clone(),
         env: Some(client_env),
     };
+    // A link takes no stdin: `cmd_link_ephemeral` never slurps one.
+    let locally =
+        |reason: String| super::passthrough::run_locally(tool, &args, cwd.as_path(), &[], &reason);
 
     // Issue #752: retry once on transport failure
     // (`lost connection to daemon`). Wedge has its own handling.
@@ -408,20 +423,20 @@ pub(super) async fn cmd_link_ephemeral(
     match outcome {
         CompileRecvOutcome::Done(recv_result) => {
             relay_link_response(recv_result, &mut std::io::stdout(), &mut std::io::stderr())
+                .unwrap_or_else(|| {
+                    locally(format!("daemon at {endpoint} returned no link verdict"))
+                })
         }
         CompileRecvOutcome::Wedged => {
             eprintln!(
-                "zccache[err][W]: daemon at {endpoint} stopped responding within \
+                "zccache[warn][W]: daemon at {endpoint} stopped responding within \
                  the wedge budget on a Link; killing it so the next request starts \
                  fresh — issue #666"
             );
             stop_stale_daemon(endpoint).await;
-            ExitCode::FAILURE
+            locally(format!("daemon at {endpoint} was wedged"))
         }
-        CompileRecvOutcome::Failed(msg) => {
-            eprintln!("zccache[err][R]: {msg}");
-            ExitCode::FAILURE
-        }
+        CompileRecvOutcome::Failed(msg) => locally(msg),
     }
 }
 
@@ -516,11 +531,19 @@ fn emit_client_disconnected_event(endpoint: &str, cause: &str, detail: &str) {
     );
 }
 
+/// Relay a daemon response that carries a compiler verdict.
+///
+/// `Some(code)` means the daemon reported what the compiler actually did —
+/// success or a genuine compile error, cached or fresh — and that code is the
+/// build's answer. `None` means the daemon produced no verdict at all (lost
+/// connection, daemon-side error, unexpected message); the caller answers by
+/// running the compiler itself rather than inventing a failure the compiler
+/// never reported. See [`super::passthrough::run_locally`].
 fn relay_compile_response<W: Write, E: Write>(
     recv_result: Option<crate::protocol::Response>,
     stdout: &mut W,
     stderr: &mut E,
-) -> ExitCode {
+) -> Option<ExitCode> {
     match recv_result {
         Some(crate::protocol::Response::CompileResult {
             exit_code,
@@ -530,31 +553,35 @@ fn relay_compile_response<W: Write, E: Write>(
         }) => {
             let _ = stdout.write_all(&out);
             let _ = stderr.write_all(&err);
-            exit_code_from_i32(exit_code)
+            Some(exit_code_from_i32(exit_code))
         }
         Some(crate::protocol::Response::Error { message }) => {
             let _ = writeln!(stderr, "zccache[err][E]: daemon error: {message}");
-            ExitCode::FAILURE
+            None
         }
         None => {
             let _ = writeln!(stderr, "{LOST_CONNECTION_MSG}");
-            ExitCode::FAILURE
+            None
         }
         Some(other) => {
             let _ = writeln!(
                 stderr,
                 "zccache[err][U]: unexpected response from daemon: {other:?}"
             );
-            ExitCode::FAILURE
+            None
         }
     }
 }
 
+/// Relay a daemon response that carries a linker/archiver verdict.
+///
+/// Same contract as [`relay_compile_response`]: `None` means the daemon
+/// produced no verdict, and the caller runs the tool itself.
 fn relay_link_response<W: Write, E: Write>(
     recv_result: Option<crate::protocol::Response>,
     stdout: &mut W,
     stderr: &mut E,
-) -> ExitCode {
+) -> Option<ExitCode> {
     match recv_result {
         Some(crate::protocol::Response::LinkResult {
             exit_code,
@@ -568,22 +595,22 @@ fn relay_link_response<W: Write, E: Write>(
             if let Some(w) = warning {
                 let _ = writeln!(stderr, "zccache warning: {w}");
             }
-            exit_code_from_i32(exit_code)
+            Some(exit_code_from_i32(exit_code))
         }
         Some(crate::protocol::Response::Error { message }) => {
             let _ = writeln!(stderr, "zccache[err][E]: daemon error: {message}");
-            ExitCode::FAILURE
+            None
         }
         None => {
             let _ = writeln!(stderr, "{LOST_CONNECTION_MSG}");
-            ExitCode::FAILURE
+            None
         }
         Some(other) => {
             let _ = writeln!(
                 stderr,
                 "zccache[err][U]: unexpected response from daemon: {other:?}"
             );
-            ExitCode::FAILURE
+            None
         }
     }
 }
@@ -609,9 +636,104 @@ mod tests {
             &mut stderr,
         );
 
-        assert_eq!(exit, ExitCode::from(7));
+        assert_eq!(exit, Some(ExitCode::from(7)));
         assert_eq!(stdout, b"compiler-out");
         assert_eq!(stderr, b"compiler-err");
+    }
+
+    // ── Transparency: a daemon fault is not a compile verdict ──────────
+    //
+    // The wrapper may only report what the compiler actually did. A real
+    // `CompileResult` — including a genuine compile error — is the build's
+    // answer and is relayed verbatim. Every other outcome means the daemon
+    // produced no verdict, and the relay must say so (`None`) so the caller
+    // runs the compiler instead of failing a build that compiles cleanly
+    // without the wrapper.
+
+    #[test]
+    fn compile_relay_reports_a_real_compile_error_as_a_verdict() {
+        // rustc genuinely failed: the daemon ran it and it exited 1. That is
+        // the compiler's own answer and must pass through untouched — the
+        // fallback must NOT mask it by recompiling.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = relay_compile_response(
+            Some(crate::protocol::Response::CompileResult {
+                exit_code: 1,
+                stdout: Arc::new(Vec::new()),
+                stderr: Arc::new(b"error[E0425]: cannot find value `x`".to_vec()),
+                cached: true,
+            }),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(
+            exit,
+            Some(ExitCode::from(1)),
+            "a real compile error is a verdict and must be relayed, not retried"
+        );
+        assert_eq!(stderr, b"error[E0425]: cannot find value `x`");
+    }
+
+    #[test]
+    fn compile_relay_reports_no_verdict_when_connection_is_lost() {
+        // The daemon crashed or was killed mid-request. Pre-fix this returned
+        // ExitCode::FAILURE, so cargo reported `could not compile <crate>`
+        // with no diagnostics for a crate that compiles fine.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = relay_compile_response(None, &mut stdout, &mut stderr);
+
+        assert_eq!(
+            exit, None,
+            "a lost daemon connection is an infrastructure fault, not a compile error"
+        );
+    }
+
+    #[test]
+    fn compile_relay_reports_no_verdict_on_daemon_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = relay_compile_response(
+            Some(crate::protocol::Response::Error {
+                message: "internal daemon failure".to_string(),
+            }),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, None, "a daemon-side error is not a compile verdict");
+    }
+
+    #[test]
+    fn compile_relay_reports_no_verdict_on_unexpected_response() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = relay_compile_response(
+            Some(crate::protocol::Response::Pong),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(
+            exit, None,
+            "a protocol desync is not a compile verdict either"
+        );
+    }
+
+    #[test]
+    fn link_relay_reports_no_verdict_when_connection_is_lost() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = relay_link_response(None, &mut stdout, &mut stderr);
+
+        assert_eq!(exit, None, "a lost daemon connection is not a link verdict");
     }
 
     // ── Issue #666: wedge-detection helper ──────────────────────────────
@@ -956,7 +1078,7 @@ mod tests {
             &mut stderr,
         );
 
-        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(exit, Some(ExitCode::SUCCESS));
         assert_eq!(stdout, b"link-out");
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
