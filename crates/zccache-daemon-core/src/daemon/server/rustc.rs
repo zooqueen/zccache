@@ -575,6 +575,31 @@ pub(super) fn compiler_is_rustc_like(compiler_path: &Path) -> bool {
         == crate::compiler::CompilerFamily::Rustc
 }
 
+/// Length (0 or 1) of the leading `RUSTC_WORKSPACE_WRAPPER` rustc-shim in a
+/// rustc-family argument vector.
+///
+/// `cargo clippy` layers `RUSTC_WORKSPACE_WRAPPER=clippy-driver` on top of
+/// `RUSTC_WRAPPER=zccache`, so cargo runs `clippy-driver <rustc-shim>
+/// <compile args>`. clippy-driver enters rustc-wrapper mode — and strips the
+/// shim — only when its first argument is a path whose file stem is `rustc`
+/// (the same predicate clippy-driver itself applies to `argv[1]`). Any flags
+/// zccache injects into the argument vector must therefore land after this
+/// shim so it stays the leading argument; otherwise clippy-driver stops
+/// stripping it and forwards both the shim path and the source file to rustc
+/// as inputs ("multiple input filenames provided"). Returns 1 when `args`
+/// begins with such a shim, else 0.
+pub(super) fn rustc_workspace_wrapper_shim_len(args: &[String]) -> usize {
+    match args.first() {
+        Some(first)
+            if std::path::Path::new(first).file_stem()
+                == Some(std::ffi::OsStr::new("rustc")) =>
+        {
+            1
+        }
+        _ => 0,
+    }
+}
+
 pub(super) fn rustc_request_key_root(
     args: &[String],
     worktree_root: Option<&NormalizedPath>,

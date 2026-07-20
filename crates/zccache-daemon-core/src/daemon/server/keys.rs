@@ -264,10 +264,17 @@ pub(super) fn effective_compile_args(
             return expanded_args.to_vec();
         }
 
+        // Under `cargo clippy` the leading argument is the rustc-shim that
+        // clippy-driver strips to enter wrapper mode; the injected remap must
+        // follow it so the shim stays clippy-driver's first argument. For a
+        // plain rustc compile there is no shim (`shim == 0`) and the remap
+        // leads the vector as before.
+        let shim = rustc_workspace_wrapper_shim_len(expanded_args);
         let mut effective = Vec::with_capacity(expanded_args.len() + 2);
+        effective.extend_from_slice(&expanded_args[..shim]);
         effective.push("--remap-path-prefix".to_string());
         effective.push(format!("{}=.", root_path.to_string_lossy()));
-        effective.extend_from_slice(expanded_args);
+        effective.extend_from_slice(&expanded_args[shim..]);
         return effective;
     }
 

@@ -443,6 +443,83 @@ fn effective_compile_args_auto_keeps_existing_rust_root_remap() {
 }
 
 #[test]
+fn effective_compile_args_rust_remap_follows_clippy_workspace_wrapper_shim() {
+    // `cargo clippy` runs with RUSTC_WRAPPER=zccache AND
+    // RUSTC_WORKSPACE_WRAPPER=clippy-driver, so cargo invokes
+    // `clippy-driver <rustc-shim> <compile args>`; the daemon then sees
+    // compiler=clippy-driver, args=[<rustc-shim>, ...]. clippy-driver strips
+    // that shim to act as rustc-with-lints only when it is the FIRST argument.
+    // The auto-injected --remap-path-prefix must therefore be inserted AFTER
+    // the shim — prepending it ahead of the shim moves the shim off the leading
+    // position, clippy-driver stops stripping it, and rustc then receives both
+    // the shim path and the source as inputs ("multiple input filenames").
+    let tmp = tempfile::tempdir().unwrap();
+    let root_path = tmp.path().join("workspace");
+    let root = NormalizedPath::new(&root_path);
+    let env = vec![(PATH_REMAP_ENV.to_string(), "auto".to_string())];
+    let rustc_shim =
+        "/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc".to_string();
+    let args = vec![
+        rustc_shim.clone(),
+        "--crate-name".to_string(),
+        "demo".to_string(),
+        "src/main.rs".to_string(),
+    ];
+
+    let effective = effective_compile_args(
+        &args,
+        Path::new("clippy-driver"),
+        &root_path,
+        Some(&root),
+        Some(&env),
+    );
+
+    // The rustc shim stays the leading argument so clippy-driver strips it.
+    assert_eq!(effective[0], rustc_shim, "shim must remain first: {effective:?}");
+    // The remap is injected immediately AFTER the shim.
+    assert_eq!(
+        &effective[1..3],
+        &[
+            "--remap-path-prefix".to_string(),
+            format!("{}=.", root_path.display()),
+        ],
+        "remap must follow the shim: {effective:?}"
+    );
+    // The remaining compile args follow unchanged and in order.
+    assert_eq!(
+        &effective[3..],
+        &[
+            "--crate-name".to_string(),
+            "demo".to_string(),
+            "src/main.rs".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn rustc_workspace_wrapper_shim_len_detects_leading_rustc_path() {
+    // A leading rustc path (any directory, with or without `.exe`) is the
+    // clippy-driver workspace-wrapper shim → length 1.
+    assert_eq!(
+        rustc_workspace_wrapper_shim_len(&[
+            "/x/y/bin/rustc".to_string(),
+            "--crate-name".to_string(),
+        ]),
+        1
+    );
+    assert_eq!(
+        rustc_workspace_wrapper_shim_len(&["rustc.exe".to_string(), "src/lib.rs".to_string()]),
+        1
+    );
+    // A plain rustc compile (no workspace wrapper) leads with a flag → 0.
+    assert_eq!(
+        rustc_workspace_wrapper_shim_len(&["--crate-name".to_string(), "demo".to_string()]),
+        0
+    );
+    assert_eq!(rustc_workspace_wrapper_shim_len(&[]), 0);
+}
+
+#[test]
 fn link_flag_normalization_keeps_outputs_root_specific() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("workspace-a");
